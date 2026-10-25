@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="es">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ARCHIVA</title>
@@ -2580,6 +2581,8 @@ body::before { background: var(--color-bg); }
   .filter-bar__group .select-wrap::after { right: 12px; width: 7px; height: 7px; }
 }
 </style>
+</head>
+<body>
 <div class="bg-fx" aria-hidden="true"></div>
 <div class="app-shell">
   <div class="sidebar-backdrop" id="backdrop" hidden></div>
@@ -2610,7 +2613,8 @@ body::before { background: var(--color-bg); }
 /* ARCHIVA en internet: datos en Supabase, acceso solo con usuario y contraseña. */
 /* Cambia false por true cuando termines de subir: se ocultan Subir, editar y borrar para todos. */
 const SOLO_LECTURA = false;
-const blobUrl = (id) => 'https://csvvhvstkzkypvznaluj.supabase.co/storage/v1/object/public/archiva/' + encodeURIComponent(id);
+/* true = solo el administrador puede descargar tablas y ver columnas completas. Pon false para permitirlo a todos. */
+const SOLO_ADMIN_EXPORTAR = true;
 (() => {
   'use strict';
   const sb = window.supabase.createClient('https://csvvhvstkzkypvznaluj.supabase.co', 'sb_publishable_sKnog8uqFcSyjaLhappH6Q_cE3oxRFP');
@@ -2619,9 +2623,13 @@ const blobUrl = (id) => 'https://csvvhvstkzkypvznaluj.supabase.co/storage/v1/obj
   let admin = false;
   const listeners = [];
   const query = async (q) => {
-    const { data, error } = await sb.from('docs').select('id,data').eq('coleccion', q.name);
-    if (error) throw error;
-    const rows = data.slice();
+    const rows = [];
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await sb.from('docs').select('id,data').eq('coleccion', q.name).order('id').range(from, from + 999);
+      if (error) throw error;
+      rows.push(...data);
+      if (data.length < 1000) break;
+    }
     if (q.order) {
       const [f, dir] = q.order;
       rows.sort((a, b) => { const x = a.data[f], y = b.data[f]; return (x > y ? 1 : x < y ? -1 : 0) * (dir === 'desc' ? -1 : 1); });
@@ -2682,7 +2690,7 @@ const blobUrl = (id) => 'https://csvvhvstkzkypvznaluj.supabase.co/storage/v1/obj
       <button class="button button--primary" type="submit" id="lg-b">Entrar</button><p id="lg-m" style="margin:0;color:#ff7b7b"></p></form>`;
     const finish = async () => {
       try { const { data } = await sb.rpc('es_admin'); admin = data === true; } catch { admin = false; }
-      box.remove(); resolve();
+      window.__isAdmin = admin; box.remove(); resolve();
     };
     box.querySelector('form').addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -3181,7 +3189,7 @@ function listHTML(rows) {
 function gridHTML(rows) {
   return `<div class="file-grid">${rows.map(({ f, snippet }) => `<article class="file-card${effStatus(f) === 'processing' ? ' file-card--processing' : ''}">
       <button class="link-button file-card__open" type="button" data-open="${f.id}" aria-label="Abrir ${esc(f.name)}">
-        <span class="file-card__preview">${f.kind === 'image' && !f.wrapped ? `<img src="${blobUrl(f.assetId)}" alt="" loading="lazy">` : typeIcon(f.kind, 32)}</span>
+        <span class="file-card__preview">${typeIcon(f.kind, 32)}</span>
       </button>
       <div class="file-card__body">
         <div class="file-card__header"><button class="link-button" type="button" data-open="${f.id}"><span class="file-card__name" role="heading" aria-level="3">${highlight(f.name)}</span></button></div>
@@ -3358,8 +3366,7 @@ function makeCsvParser(delim, emit) {
   };
 }
 async function makeImporter(it, f) {
-  const prev = S.files.find((x) => x.name === f.name);
-  await borrarFilas(f.name, (prev && prev.rows) || 0);
+  it.old = await marcaViejas(f.name); it.committed = false; it.filaMax = 0;
   let pre = null, plan = null, buf = [], total = 0, fila = 0, read = 0, seen = [];
   const toObj = (r) => { const o = {}; plan.map.forEach((c, i) => { if (c) { const v = String(r[i] ?? '').trim(); if (v) o[c] = v; } }); return o; };
   const setPlan = () => {
@@ -3370,6 +3377,7 @@ async function makeImporter(it, f) {
   const flush = async (all) => {
     while (buf.length >= 1000 || (all && buf.length)) {
       const batch = buf.splice(0, 1000).map((o) => ({ ...o, archivo: f.name, fila: ++fila, busqueda: colNorm(COLORD.map((c) => o[c] || '').join(' ')) }));
+      it.filaMax = fila;
       let err;
       for (let t = 0; t < 3; t++) {
         ({ error: err } = await window.__sb.from('personas').insert(batch));
@@ -3392,7 +3400,7 @@ async function makeImporter(it, f) {
     addRead(n) { read += n; },
     pending() { return buf.length >= 1000; },
     flush,
-    async finish() { await flush(true); if (!total) throw { code: 'sin_columnas', seen }; return total; }
+    async finish() { await flush(true); if (!total) throw { code: 'sin_columnas', seen }; it.committed = true; await borrarFilas(f.name, it.old.fila, it.old.id); return total; }
   };
 }
 async function importCsv(it, f) {
@@ -3547,14 +3555,34 @@ async function importXlsx(it, f) {
     throw e;
   }
 }
-async function borrarFilas(name, n) {
-  for (let a = 0; a < n; a += 5000) {
-    const { error } = await window.__sb.from('personas').delete().eq('archivo', name).gt('fila', a).lte('fila', a + 5000);
+async function marcaViejas(name) {
+  const sb = window.__sb;
+  const a = await sb.from('personas').select('id').eq('archivo', name).order('id', { ascending: false }).limit(1);
+  if (a.error) throw a.error;
+  const id = a.data && a.data[0] ? a.data[0].id : 0;
+  if (!id) return { id: 0, fila: 0 };
+  const b = await sb.from('personas').select('fila').eq('archivo', name).lte('id', id).order('fila', { ascending: false, nullsFirst: false }).limit(1);
+  if (b.error) throw b.error;
+  return { id, fila: (b.data && b.data[0] && b.data[0].fila) || 0 };
+}
+async function quitarNuevas(name, idViejo, hasta) {
+  for (let a = 0; a < hasta; a += 5000) {
+    const { error } = await window.__sb.from('personas').delete().eq('archivo', name).gt('id', idViejo).gt('fila', a).lte('fila', a + 5000);
     if (error) throw error;
   }
 }
+async function borrarFilas(name, n, idViejo) {
+  if (!idViejo) return;
+  for (let a = 0; a < n; a += 5000) {
+    const { error } = await window.__sb.from('personas').delete().eq('archivo', name).lte('id', idViejo).gt('fila', a).lte('fila', a + 5000);
+    if (error) throw error;
+  }
+  const rest = await window.__sb.from('personas').delete().eq('archivo', name).lte('id', idViejo);
+  if (rest.error) throw rest.error;
+}
 async function runItem(it) {
   const f = it.file;
+  it.old = null; it.committed = false; it.filaMax = 0;
   try {
     it.status = 'processing'; paintItem(it);
     if (!f.size) throw { code: 'empty' };
@@ -3587,7 +3615,7 @@ async function runItem(it) {
     wb = null;
     if (!rows.length) throw { code: 'sin_columnas', seen };
     const prev = S.files.find((x) => x.name === f.name);
-    await borrarFilas(f.name, Math.max(rows.length, (prev && prev.rows) || 0));
+    it.old = await marcaViejas(f.name); it.committed = false; it.filaMax = rows.length;
     const total = Math.ceil(rows.length / 1000);
     for (let i = 0; i < rows.length; i += 1000) {
       it.status = 'uploading'; it.progress = { done: i / 1000, total }; paintItem(it);
@@ -3600,12 +3628,15 @@ async function runItem(it) {
       }
       if (err) throw { code: 'db' };
     }
+    it.committed = true;
+    await borrarFilas(f.name, it.old.fila, it.old.id);
     const now = new Date().toISOString();
     const ref = prev ? S.db.collection('files').doc(prev.id) : S.db.collection('files').doc();
     await ref.set({ name: f.name, originalName: f.name, ext, kind, size: f.size, rows: rows.length, tags: (prev && prev.tags) || [], notes: (prev && prev.notes) || '', fav: !!(prev && prev.fav), status: 'available', hasText: false, createdAt: (prev && prev.createdAt) || now, updatedAt: now });
     it.docId = ref.id; it.status = 'done'; paintItem(it);
     if (ign.size) toast('Columnas no reconocidas (no se guardaron)', [...ign].join(', '), 'warning');
   } catch (e) {
+    if (it.old && !it.committed) { try { await quitarNuevas(f.name, it.old.id, it.filaMax || 0); } catch { /* se limpia al reintentar */ } }
     const c = e && e.code;
     it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'xlsx_grande' ? 'Este Excel es muy pesado para leerlo en el celular. Guárdalo como .xlsx o CSV y súbelo otra vez.' : c === 'sin_columnas' ? 'No encontré columnas conocidas. En la primera fila vi: ' + ((e.seen || []).join(', ') || 'nada') + '.' + (e.diag ? ' (' + e.diag + ')' : '') : 'No se pudo guardar en la base de datos. Revisa tu conexión y reintenta.';
     it.retryable = !['empty', 'formato', 'sin_columnas', 'xlsx_grande'].includes(c);
@@ -3647,9 +3678,9 @@ async function fileBytes(f) {
   const chunks = [];
   let total = 0;
   for (const id of partIds(f)) {
-    const res = await fetch(blobUrl(id));
-    if (!res.ok) throw new Error('missing');
-    const b = f.wrapped ? base64ToBytes(await res.text()) : new Uint8Array(await res.arrayBuffer());
+    const { data: blob, error } = await window.__sb.storage.from('archiva').download(id);
+    if (error || !blob) throw new Error('missing');
+    const b = f.wrapped ? base64ToBytes(await blob.text()) : new Uint8Array(await blob.arrayBuffer());
     chunks.push(b); total += b.length;
   }
   if (chunks.length === 1) return chunks[0];
@@ -3658,7 +3689,25 @@ async function fileBytes(f) {
   for (const c of chunks) { out.set(c, pos); pos += c.length; }
   return out;
 }
-async function download(f) { toast('Los datos están en la base de datos', 'Esta tabla no se guarda como archivo. Usa la búsqueda y «Ver como columna».', 'info'); }
+async function download(f) {
+  if (SOLO_ADMIN_EXPORTAR && !window.__isAdmin) { toast('Solo el administrador puede descargar tablas', '', 'warning'); return; }
+  if (!S.downloads) { toast('La descarga no está disponible aquí', 'Tu navegador no permite guardar desde aquí.', 'warning'); return; }
+  try {
+    toast('Preparando descarga…', f.name, 'info');
+    const cols = COLORD, lines = [];
+    const cel = (v) => { let t = String(v ?? ''); if (/^[=+\-@\t\r]/.test(t)) t = "'" + t; return '"' + t.replace(/"/g, '""') + '"'; };
+    lines.push(cols.map((c) => cel(LABEL[c])).join(','));
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await window.__sb.from('personas').select('*').eq('archivo', f.name).order('fila').order('id').range(from, from + 999);
+      if (error) throw error;
+      for (const r of data) lines.push(cols.map((c) => cel(r[c])).join(','));
+      if (data.length < 1000) break;
+    }
+    const name = (f.name || 'tabla').replace(/\.[^.]+$/, '') + '.csv';
+    await S.downloads.save({ filename: name, data: new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' }) });
+    toast('Descarga lista', name);
+  } catch { toast('No se pudo descargar', 'Intenta de nuevo.', 'error'); }
+}
 
 /* ---------- Detail ---------- */
 let previewFor = null, previewUrl = null, previewPdf = null;
@@ -3826,6 +3875,7 @@ function paintColResult() {
 }
 
 async function openColumn(q) {
+  if (SOLO_ADMIN_EXPORTAR && !window.__isAdmin) { toast('Solo el administrador puede ver columnas completas', '', 'warning'); return; }
   const my = ++colRun;
   const root = $('#dialog-root');
   root.innerHTML = colShell(`<h2 style="margin:var(--space-4) 0 var(--space-2)">Columna «${esc(q)}»</h2><p id="col-prog" style="color:var(--color-text-muted)">Preparando…</p><p style="color:var(--color-text-muted)">Puede tardar un poco. No cierres esta pantalla.</p>`);
@@ -4038,3 +4088,5 @@ function refreshTagFilter() {
 }
 })();
 </script>
+</body>
+</html>
