@@ -2607,6 +2607,7 @@ body::before { background: var(--color-bg); }
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0/dist/umd/supabase.min.js"></script>
 <script>
 /* ARCHIVA en internet: datos en Supabase, acceso solo con usuario y contraseña. */
+const blobUrl = (id) => 'https://csvvhvstkzkypvznaluj.supabase.co/storage/v1/object/public/archiva/' + encodeURIComponent(id);
 (() => {
   'use strict';
   const sb = window.supabase.createClient('https://csvvhvstkzkypvznaluj.supabase.co', 'sb_publishable_sKnog8uqFcSyjaLhappH6Q_cE3oxRFP');
@@ -2650,8 +2651,13 @@ body::before { background: var(--color-bg); }
     return api;
   };
   const assets = {
-    async upload() { throw { code: 'no' }; },
-    async delete() {},
+    async upload(file, opt) {
+      const id = uid();
+      const { error } = await sb.storage.from('archiva').upload(id, file, { contentType: (opt && opt.type) || file.type || 'application/octet-stream' });
+      if (error) throw error;
+      return { id };
+    },
+    async delete(id) { const { error } = await sb.storage.from('archiva').remove([id]); if (error) throw error; },
     async list() { return { assets: [], usage: { bytes: 0, maxBytes: 0 } }; }
   };
   const downloads = {
@@ -3172,7 +3178,7 @@ function listHTML(rows) {
 function gridHTML(rows) {
   return `<div class="file-grid">${rows.map(({ f, snippet }) => `<article class="file-card${effStatus(f) === 'processing' ? ' file-card--processing' : ''}">
       <button class="link-button file-card__open" type="button" data-open="${f.id}" aria-label="Abrir ${esc(f.name)}">
-        <span class="file-card__preview">${f.kind === 'image' && !f.wrapped ? `<img src="/_blob/${esc(f.assetId)}" alt="" loading="lazy">` : typeIcon(f.kind, 32)}</span>
+        <span class="file-card__preview">${f.kind === 'image' && !f.wrapped ? `<img src="${blobUrl(f.assetId)}" alt="" loading="lazy">` : typeIcon(f.kind, 32)}</span>
       </button>
       <div class="file-card__body">
         <div class="file-card__header"><button class="link-button" type="button" data-open="${f.id}"><span class="file-card__name" role="heading" aria-level="3">${highlight(f.name)}</span></button></div>
@@ -3381,7 +3387,7 @@ async function fileBytes(f) {
   const chunks = [];
   let total = 0;
   for (const id of partIds(f)) {
-    const res = await fetch('/_blob/' + encodeURIComponent(id));
+    const res = await fetch(blobUrl(id));
     if (!res.ok) throw new Error('missing');
     const b = f.wrapped ? base64ToBytes(await res.text()) : new Uint8Array(await res.arrayBuffer());
     chunks.push(b); total += b.length;
