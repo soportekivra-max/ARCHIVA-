@@ -2725,6 +2725,7 @@ const effStatus = (f) => ((f.status === 'processing' && Date.now() - new Date(f.
 const MAX_TEXT = 80000;                 // characters indexed per file
 const PAGE_SIZE = 50;
 const CONCURRENCY = 2;
+const PAR = 4;                         // lotes de 1000 filas que se suben a la vez por archivo
 const LIBS = {
   pdf: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
   pdfWorker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
@@ -3233,7 +3234,7 @@ function renderUpload() {
         <p class="upload-dropzone__title" id="dz-title">Arrastra tus tablas aquí</p>
         <p class="upload-dropzone__description">o selecciónalos desde tu dispositivo</p>
         <div class="upload-dropzone__actions"><button class="button button--primary" type="button" id="pick">${icon('plus', 18)}Seleccionar tablas</button></div>
-        <p class="upload-dropzone__hint mt-4">Excel, CSV y más. Los archivos grandes se suben por partes, hasta 500 MB cada uno.</p>
+        <p class="upload-dropzone__hint mt-4">Deja esta pantalla abierta mientras sube (se mantiene encendida). Si se corta, toca reintentar y continúa donde se quedó.</p>
       </div>
     </div>
     <section class="upload-queue" id="queue" aria-label="Cola de subida"></section>`;
@@ -3288,6 +3289,15 @@ function addFiles(list) {
   if (S.view !== 'upload') go('upload'); else renderQueue();
   pump();
 }
+let wake = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wake && navigator.wakeLock) { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => { wake = null; }); }
+    else if (!on && wake) { const w = wake; wake = null; await w.release(); }
+  } catch { wake = null; }
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.running > 0) keepAwake(true); });
+window.addEventListener('beforeunload', (e) => { if (S.running > 0) { e.preventDefault(); e.returnValue = ''; } });
 function pump() {
   while (S.running < CONCURRENCY) {
     const next = S.queue.find((q) => q.status === 'queued');
@@ -3295,6 +3305,7 @@ function pump() {
     S.running++;
     runItem(next).finally(() => { S.running--; pump(); });
   }
+  keepAwake(S.running > 0);
   renderNav();
 }
 const UPLOAD_ERRORS = {
@@ -3366,27 +3377,54 @@ function makeCsvParser(delim, emit) {
   };
 }
 async function makeImporter(it, f) {
-  it.old = await marcaViejas(f.name); it.committed = false; it.filaMax = 0;
+  const rk = 'resume:' + f.name + ':' + f.size + ':' + f.lastModified;
+  it.rk = rk; it.committed = false; it.filaMax = 0;
+  let skipLeft = 0, rs = null;
+  try { rs = JSON.parse(store.get(rk, '') || 'null'); } catch { rs = null; }
+  if (rs && typeof rs.oldId === 'number' && rs.done > 0) {
+    it.old = { id: rs.oldId, fila: rs.oldFila || 0 };
+    const c = await window.__sb.from('personas').select('id', { count: 'exact', head: true }).eq('archivo', f.name).gt('id', rs.oldId).lte('fila', rs.done);
+    await quitarDesde(f.name, rs.oldId, rs.done);
+    if (!c.error && c.count === rs.done) skipLeft = rs.done;
+    else await quitarNuevas(f.name, rs.oldId, rs.done + 10000);
+  } else it.old = await marcaViejas(f.name);
   let pre = null, plan = null, buf = [], total = 0, fila = 0, read = 0, seen = [];
   const toObj = (r) => { const o = {}; plan.map.forEach((c, i) => { if (c) { const v = String(r[i] ?? '').trim(); if (v) o[c] = v; } }); return o; };
+  let skip = skipLeft; fila = skipLeft; total = skipLeft; it.filaMax = skipLeft;
+  const take = (o) => { if (skip > 0) { skip--; return; } buf.push(o); };
   const setPlan = () => {
     plan = planCols(pre);
-    if (plan) for (const r of pre.slice(plan.start)) { const o = toObj(r); if (Object.keys(o).length) buf.push(o); }
+    if (plan) for (const r of pre.slice(plan.start)) { const o = toObj(r); if (Object.keys(o).length) take(o); }
     pre = null;
   };
-  const flush = async (all) => {
-    while (buf.length >= 1000 || (all && buf.length)) {
-      const batch = buf.splice(0, 1000).map((o) => ({ ...o, archivo: f.name, fila: ++fila, busqueda: colNorm(COLORD.map((c) => o[c] || '').join(' ')) }));
-      it.filaMax = fila;
-      let err;
-      for (let t = 0; t < 3; t++) {
-        ({ error: err } = await window.__sb.from('personas').insert(batch));
-        if (!err) break;
-        await new Promise((r) => setTimeout(r, 1500 * (t + 1)));
+  const insertBatch = async (batch) => {
+    const first = batch[0].fila, last = batch[batch.length - 1].fila;
+    for (let t = 0; t < 6; t++) {
+      if (t > 0) {
+        try {
+          const c = await window.__sb.from('personas').select('id', { count: 'exact', head: true }).eq('archivo', f.name).gt('id', it.old.id).gte('fila', first).lte('fila', last);
+          if (!c.error && c.count === batch.length) return;
+        } catch { /* sigue reintentando */ }
       }
-      if (err) throw { code: 'db' };
-      total += batch.length;
-      it.status = 'uploading'; it.progress = { done: Math.min(Math.floor(read / 1048576), Math.ceil(f.size / 1048576)), total: Math.max(1, Math.ceil(f.size / 1048576)) }; paintItem(it);
+      let err = null;
+      try { ({ error: err } = await window.__sb.from('personas').insert(batch)); } catch (e) { err = e || true; }
+      if (!err) return;
+      await new Promise((r) => setTimeout(r, Math.min(30000, 1500 * 2 ** t)));
+    }
+    throw { code: 'db' };
+  };
+  const flush = async (all) => {
+    while (buf.length >= 1000 * PAR || (all && buf.length)) {
+      const group = [];
+      while (group.length < PAR && (buf.length >= 1000 || (all && buf.length))) {
+        group.push(buf.splice(0, 1000).map((o) => ({ ...o, archivo: f.name, fila: ++fila, busqueda: colNorm(COLORD.map((c) => o[c] || '').join(' ')) })));
+      }
+      it.filaMax = fila;
+      const res = await Promise.allSettled(group.map(insertBatch));
+      if (res.some((x) => x.status === 'rejected')) throw { code: 'db' };
+      total += group.reduce((n, g) => n + g.length, 0);
+      store.set(rk, JSON.stringify({ oldId: it.old.id, oldFila: it.old.fila, done: fila }));
+      it.status = 'uploading'; it.status = 'uploading'; it.progress = { done: Math.min(Math.floor(read / 1048576), Math.ceil(f.size / 1048576)), total: Math.max(1, Math.ceil(f.size / 1048576)) }; paintItem(it);
     }
   };
   return {
@@ -3394,13 +3432,13 @@ async function makeImporter(it, f) {
     row(r) {
       if (!seen.length) seen = r.map((v) => String(v).trim()).filter(Boolean).slice(0, 8);
       if (pre) { pre.push(r); if (pre.length >= 300) setPlan(); }
-      else if (plan) { const o = toObj(r); if (Object.keys(o).length) buf.push(o); }
+      else if (plan) { const o = toObj(r); if (Object.keys(o).length) take(o); }
     },
     endSheet() { if (pre && pre.length >= 2) setPlan(); pre = null; },
     addRead(n) { read += n; },
-    pending() { return buf.length >= 1000; },
+    pending() { return buf.length >= 1000 * PAR; },
     flush,
-    async finish() { await flush(true); if (!total) throw { code: 'sin_columnas', seen }; it.committed = true; await borrarFilas(f.name, it.old.fila, it.old.id); return total; }
+    async finish() { await flush(true); if (!total) throw { code: 'sin_columnas', seen }; it.committed = true; store.set(rk, ''); await borrarFilas(f.name, it.old.fila, it.old.id); return total; }
   };
 }
 async function importCsv(it, f) {
@@ -3571,6 +3609,10 @@ async function quitarNuevas(name, idViejo, hasta) {
     if (error) throw error;
   }
 }
+async function quitarDesde(name, idViejo, desde) {
+  const { error } = await window.__sb.from('personas').delete().eq('archivo', name).gt('id', idViejo).gt('fila', desde);
+  if (error) throw error;
+}
 async function borrarFilas(name, n, idViejo) {
   if (!idViejo) return;
   for (let a = 0; a < n; a += 5000) {
@@ -3582,7 +3624,7 @@ async function borrarFilas(name, n, idViejo) {
 }
 async function runItem(it) {
   const f = it.file;
-  it.old = null; it.committed = false; it.filaMax = 0;
+  it.old = null; it.committed = false; it.filaMax = 0; it.rk = null;
   try {
     it.status = 'processing'; paintItem(it);
     if (!f.size) throw { code: 'empty' };
@@ -3636,9 +3678,12 @@ async function runItem(it) {
     it.docId = ref.id; it.status = 'done'; paintItem(it);
     if (ign.size) toast('Columnas no reconocidas (no se guardaron)', [...ign].join(', '), 'warning');
   } catch (e) {
-    if (it.old && !it.committed) { try { await quitarNuevas(f.name, it.old.id, it.filaMax || 0); } catch { /* se limpia al reintentar */ } }
+    if (it.old && !it.committed && !(e && e.code === 'db' && it.rk)) {
+      try { await quitarNuevas(f.name, it.old.id, it.filaMax || 0); } catch { /* se limpia al reintentar */ }
+      if (it.rk) store.set(it.rk, '');
+    }
     const c = e && e.code;
-    it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'xlsx_grande' ? 'Este Excel es muy pesado para leerlo en el celular. Guárdalo como .xlsx o CSV y súbelo otra vez.' : c === 'sin_columnas' ? 'No encontré columnas conocidas. En la primera fila vi: ' + ((e.seen || []).join(', ') || 'nada') + '.' + (e.diag ? ' (' + e.diag + ')' : '') : 'No se pudo guardar en la base de datos. Revisa tu conexión y reintenta.';
+    it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'xlsx_grande' ? 'Este Excel es muy pesado para leerlo en el celular. Guárdalo como .xlsx o CSV y súbelo otra vez.' : c === 'sin_columnas' ? 'No encontré columnas conocidas. En la primera fila vi: ' + ((e.seen || []).join(', ') || 'nada') + '.' + (e.diag ? ' (' + e.diag + ')' : '') : 'Se cortó la conexión con la base de datos. Toca reintentar: continúa donde se quedó.';
     it.retryable = !['empty', 'formato', 'sin_columnas', 'xlsx_grande'].includes(c);
     it.status = 'error'; paintItem(it);
   }
