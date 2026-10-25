@@ -3298,6 +3298,33 @@ const UPLOAD_ERRORS = {
 const COLS = { nombre: 'nombre', nombres: 'nombre', paterno: 'paterno', 'apellido paterno': 'paterno', materno: 'materno', 'apellido materno': 'materno', fecnac: 'fecnac', 'fecha de nacimiento': 'fecnac', 'fecha nacimiento': 'fecnac', 'fec nac': 'fecnac', sexo: 'sexo', curp: 'curp', calle: 'calle', mzn: 'manzana', mz: 'manzana', manzana: 'manzana', l: 'lote', lt: 'lote', lote: 'lote', colonia: 'colonia', municipio: 'municipio', estado: 'estado', cp: 'codigo_postal', 'c p': 'codigo_postal', 'codigo postal': 'codigo_postal' };
 const LABEL = { nombre: 'NOMBRE', paterno: 'PATERNO', materno: 'MATERNO', fecnac: 'FECHA DE NACIMIENTO', sexo: 'SEXO', curp: 'CURP', calle: 'CALLE', manzana: 'MANZANA', lote: 'LOTE', colonia: 'COLONIA', municipio: 'MUNICIPIO', estado: 'ESTADO', codigo_postal: 'CÓDIGO POSTAL' };
 const COLORD = Object.keys(LABEL);
+const PAT = { curp: /^[A-Z]{4}\d{6}[HMX][A-Z]{2}[A-Z]{3}[A-Z0-9]\d$/i, fecnac: /^(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})$/, sexo: /^(H|M|F|X|HOMBRE|MUJER|MASCULINO|FEMENINO)$/i, codigo_postal: /^\d{5}$/ };
+const isNameCell = (v) => /^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ .'-]{0,38}$/.test(v);
+function inferMap(a, start, map) {
+  const sample = a.slice(start, start + 300), taken = new Set(map.filter(Boolean)), text = [];
+  for (let c = 0; c < map.length; c++) {
+    if (map[c]) continue;
+    const vals = sample.map((r) => String(r[c] ?? '').trim()).filter(Boolean);
+    if (vals.length < 3) continue;
+    let hit = false;
+    for (const k of ['curp', 'fecnac', 'sexo', 'codigo_postal']) {
+      if (!taken.has(k) && vals.filter((v) => PAT[k].test(v)).length / vals.length >= 0.6) { map[c] = k; taken.add(k); hit = true; break; }
+    }
+    if (!hit && vals.filter(isNameCell).length / vals.length >= 0.8) text.push({ c, d: new Set(vals.map((v) => v.toUpperCase())).size / vals.length });
+  }
+  const free = ['nombre', 'paterno', 'materno'].filter((k) => !taken.has(k));
+  if (free.length === 3 && text.length >= 3) {
+    const t = text.slice(0, 3), n = t.reduce((m, x) => (x.d < m.d ? x : m)), rest = t.filter((x) => x !== n);
+    map[n.c] = 'nombre'; map[rest[0].c] = 'paterno'; map[rest[1].c] = 'materno';
+  }
+  return map;
+}
+const colKey = (h) => {
+  const k = colNorm(h).replace(/[^a-z0-9]+/g, ' ').trim(), j = k.replace(/ /g, '');
+  if (!k) return null;
+  const L = { primernombre: 'nombre', apellidopaterno: 'paterno', primerapellido: 'paterno', apellidomaterno: 'materno', segundoapellido: 'materno', fechanac: 'fecnac', fechanacimiento: 'fecnac', fechadenacimiento: 'fecnac', nacimiento: 'fecnac', genero: 'sexo', codigopostal: 'codigo_postal' };
+  return COLS[k] || L[j] || COLS[j] || null;
+};
 async function borrarFilas(name, n) {
   for (let a = 0; a < n; a += 5000) {
     const { error } = await window.__sb.from('personas').delete().eq('archivo', name).gt('fila', a).lte('fila', a + 5000);
@@ -3313,19 +3340,26 @@ async function runItem(it) {
     if (kind !== 'excel' && kind !== 'csv') throw { code: 'formato' };
     const XLSX = await getXlsx();
     let wb = kind === 'csv' ? XLSX.read(decodeText(await f.arrayBuffer()).text, { type: 'string' }) : XLSX.read(new Uint8Array(await f.arrayBuffer()), { type: 'array' });
-    const rows = [], ign = new Set();
+    const rows = [], ign = new Set(), seen = [];
     for (const sn of wb.SheetNames) {
       const a = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, blankrows: false, defval: '', raw: false, dateNF: 'dd/mm/yyyy' });
       if (a.length < 2) continue;
-      const map = a[0].map((h) => { const k = colNorm(h); if (k && !COLS[k]) ign.add(String(h)); return COLS[k] || null; });
-      for (let r = 1; r < a.length; r++) {
+      let hi = 0, best = -1;
+      for (let i = 0; i < Math.min(30, a.length - 1); i++) { const n = a[i].filter((h) => colKey(h)).length; if (n > best) { best = n; hi = i; } }
+      if (!seen.length) seen.push(...a[0].map((h) => String(h).trim()).filter(Boolean).slice(0, 8));
+      const w = Math.max(...a.slice(0, 300).map((r) => r.length));
+      const map = Array.from({ length: w }, (_, i) => colKey(a[hi][i]));
+      let start = hi + 1;
+      if (best < 1) { start = a[0].some((v) => Object.values(PAT).some((p) => p.test(String(v).trim()))) ? 0 : 1; map.fill(null); }
+      inferMap(a, start, map);
+      for (let r = start; r < a.length; r++) {
         const o = {};
         map.forEach((c, i) => { if (c) { const v = String(a[r][i] ?? '').trim(); if (v) o[c] = v; } });
         if (Object.keys(o).length) rows.push(o);
       }
     }
     wb = null;
-    if (!rows.length) throw { code: 'sin_columnas' };
+    if (!rows.length) throw { code: 'sin_columnas', seen };
     const prev = S.files.find((x) => x.name === f.name);
     await borrarFilas(f.name, Math.max(rows.length, (prev && prev.rows) || 0));
     const total = Math.ceil(rows.length / 1000);
@@ -3347,7 +3381,7 @@ async function runItem(it) {
     if (ign.size) toast('Columnas no reconocidas (no se guardaron)', [...ign].join(', '), 'warning');
   } catch (e) {
     const c = e && e.code;
-    it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'sin_columnas' ? 'No encontré columnas conocidas (NOMBRE, PATERNO, MATERNO, FECNAC, SEXO…).' : 'No se pudo guardar en la base de datos. Revisa tu conexión y reintenta.';
+    it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'sin_columnas' ? 'No encontré columnas conocidas. En la primera fila vi: ' + ((e.seen || []).join(', ') || 'nada') + '.' : 'No se pudo guardar en la base de datos. Revisa tu conexión y reintenta.';
     it.retryable = !['empty', 'formato', 'sin_columnas'].includes(c);
     it.status = 'error'; paintItem(it);
   }
