@@ -3520,24 +3520,32 @@ async function unzipPass(f, want, onData, afterPush) {
   }
   if (failure) throw failure;
 }
+const noNs = (t) => t.replace(/<(\/?)[A-Za-z_][\w.-]*:/g, '<$1');
+const zname = (n) => n.replace(/\\/g, '/').replace(/^\//, '').toLowerCase();
 async function importXlsx(it, f) {
-  const strings = [], dateXf = [], sst = { dec: new TextDecoder(), carry: '' }, sty = { dec: new TextDecoder(), text: '' };
-  await unzipPass(f, (n) => (n === 'xl/sharedStrings.xml' ? 'sst' : n === 'xl/styles.xml' ? 'sty' : null), (key, data, final) => {
-    if (key === 'sty') { sty.text += sty.dec.decode(data, { stream: !final }); if (final) parseStyles(sty.text, dateXf); }
-    else { sst.carry += sst.dec.decode(data, { stream: !final }); sst.carry = takeSi(sst.carry, strings); }
+  const strings = [], dateXf = [], names = new Set(), sst = { dec: new TextDecoder(), carry: '' }, sty = { dec: new TextDecoder(), text: '' };
+  let rawRows = 0, dataRows = 0;
+  await unzipPass(f, (n) => { names.add(n); const z = zname(n); return z === 'xl/sharedstrings.xml' ? 'sst' : z === 'xl/styles.xml' ? 'sty' : null; }, (key, data, final) => {
+    if (key === 'sty') { sty.text += sty.dec.decode(data, { stream: !final }); if (final) parseStyles(noNs(sty.text), dateXf); }
+    else { sst.carry = takeSi(noNs(sst.carry + sst.dec.decode(data, { stream: !final })), strings); }
   });
   const imp = await makeImporter(it, f), sh = { dec: new TextDecoder(), carry: '' };
   let started = false;
-  const onRow = (x) => { const r = parseRow(x, strings, dateXf); if (r.some((v) => v !== '')) imp.row(r); };
+  const onRow = (x) => { rawRows++; const r = parseRow(x, strings, dateXf); if (r.some((v) => v !== '')) { dataRows++; imp.row(r); } };
   await unzipPass(f, (n) => {
-    if (!/^xl\/worksheets\/[^/]+\.xml$/.test(n)) return null;
+    names.add(n);
+    if (!/^xl\/worksheets\/[^/]+\.xml$/.test(zname(n))) return null;
     if (started) imp.endSheet();
     imp.startSheet(); started = true; sh.dec = new TextDecoder(); sh.carry = '';
     return 'sheet';
-  }, (key, data, final) => { sh.carry += sh.dec.decode(data, { stream: !final }); sh.carry = takeRows(sh.carry, onRow); },
+  }, (key, data, final) => { sh.carry = takeRows(noNs(sh.carry + sh.dec.decode(data, { stream: !final })), onRow); },
   async (n) => { imp.addRead(n); if (imp.pending()) await imp.flush(false); });
   if (started) imp.endSheet();
-  return imp.finish();
+  try { return await imp.finish(); }
+  catch (e) {
+    if (e && e.code === 'sin_columnas') e.diag = 'archivos: ' + [...names].slice(0, 12).join(' ') + ' · textos: ' + strings.length + ' · filas: ' + rawRows + ' · con datos: ' + dataRows;
+    throw e;
+  }
 }
 async function borrarFilas(name, n) {
   for (let a = 0; a < n; a += 5000) {
@@ -3599,7 +3607,7 @@ async function runItem(it) {
     if (ign.size) toast('Columnas no reconocidas (no se guardaron)', [...ign].join(', '), 'warning');
   } catch (e) {
     const c = e && e.code;
-    it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'xlsx_grande' ? 'Este Excel es muy pesado para leerlo en el celular. Guárdalo como .xlsx o CSV y súbelo otra vez.' : c === 'sin_columnas' ? 'No encontré columnas conocidas. En la primera fila vi: ' + ((e.seen || []).join(', ') || 'nada') + '.' : 'No se pudo guardar en la base de datos. Revisa tu conexión y reintenta.';
+    it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'xlsx_grande' ? 'Este Excel es muy pesado para leerlo en el celular. Guárdalo como .xlsx o CSV y súbelo otra vez.' : c === 'sin_columnas' ? 'No encontré columnas conocidas. En la primera fila vi: ' + ((e.seen || []).join(', ') || 'nada') + '.' + (e.diag ? ' (' + e.diag + ')' : '') : 'No se pudo guardar en la base de datos. Revisa tu conexión y reintenta.';
     it.retryable = !['empty', 'formato', 'sin_columnas', 'xlsx_grande'].includes(c);
     it.status = 'error'; paintItem(it);
   }
