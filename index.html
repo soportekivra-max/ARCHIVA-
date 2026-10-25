@@ -2604,9 +2604,12 @@ body::before { background: var(--color-bg); }
 <div id="dialog-root"></div>
 <input type="file" id="file-input" multiple hidden>
 
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0/dist/umd/supabase.min.js"></script>
 <script>
 /* ARCHIVA en internet: datos en Supabase, acceso solo con usuario y contraseña. */
+/* Cambia false por true cuando termines de subir: se ocultan Subir, editar y borrar para todos. */
+const SOLO_LECTURA = false;
 const blobUrl = (id) => 'https://csvvhvstkzkypvznaluj.supabase.co/storage/v1/object/public/archiva/' + encodeURIComponent(id);
 (() => {
   'use strict';
@@ -2693,7 +2696,7 @@ const blobUrl = (id) => 'https://csvvhvstkzkypvznaluj.supabase.co/storage/v1/obj
     document.body.appendChild(box);
     sb.auth.getSession().then(({ data }) => { if (data && data.session) finish(); });
   });
-  window.claude = { use: async (n) => { await ready; return n === 'db' ? { collection } : n === 'assets' ? (admin ? assets : null) : n === 'downloads' ? downloads : null; } };
+  window.claude = { use: async (n) => { await ready; return n === 'db' ? { collection } : n === 'assets' ? (admin && !SOLO_LECTURA ? assets : null) : n === 'downloads' ? downloads : null; } };
 })();
 </script>
 <script>
@@ -3325,6 +3328,217 @@ const colKey = (h) => {
   const L = { primernombre: 'nombre', apellidopaterno: 'paterno', primerapellido: 'paterno', apellidomaterno: 'materno', segundoapellido: 'materno', fechanac: 'fecnac', fechanacimiento: 'fecnac', fechadenacimiento: 'fecnac', nacimiento: 'fecnac', genero: 'sexo', codigopostal: 'codigo_postal' };
   return COLS[k] || L[j] || COLS[j] || null;
 };
+function planCols(a) {
+  if (a.length < 2) return null;
+  let hi = 0, best = -1;
+  for (let i = 0; i < Math.min(30, a.length - 1); i++) { const n = a[i].filter((h) => colKey(h)).length; if (n > best) { best = n; hi = i; } }
+  const w = Math.max(...a.map((r) => r.length));
+  const map = Array.from({ length: w }, (_, i) => colKey(a[hi][i]));
+  let start = hi + 1;
+  if (best < 1) { start = a[0].some((v) => Object.values(PAT).some((p) => p.test(String(v).trim()))) ? 0 : 1; map.fill(null); }
+  inferMap(a, start, map);
+  return { map, start, seen: a[0].map((h) => String(h).trim()).filter(Boolean).slice(0, 8) };
+}
+function makeCsvParser(delim, emit) {
+  let field = '', row = [], q = false, prevQ = false;
+  const endRow = () => { row.push(field); field = ''; if (row.length > 1 || row[0] !== '') emit(row); row = []; };
+  return {
+    push(t) {
+      for (let i = 0; i < t.length; i++) {
+        const ch = t[i];
+        if (q) { if (ch === '"') { q = false; prevQ = true; } else field += ch; continue; }
+        if (prevQ) { prevQ = false; if (ch === '"') { field += '"'; q = true; continue; } }
+        if (ch === '"' && field === '') q = true;
+        else if (ch === delim) { row.push(field); field = ''; }
+        else if (ch === '\n') endRow();
+        else if (ch !== '\r') field += ch;
+      }
+    },
+    end() { if (field !== '' || row.length) endRow(); }
+  };
+}
+async function makeImporter(it, f) {
+  const prev = S.files.find((x) => x.name === f.name);
+  await borrarFilas(f.name, (prev && prev.rows) || 0);
+  let pre = null, plan = null, buf = [], total = 0, fila = 0, read = 0, seen = [];
+  const toObj = (r) => { const o = {}; plan.map.forEach((c, i) => { if (c) { const v = String(r[i] ?? '').trim(); if (v) o[c] = v; } }); return o; };
+  const setPlan = () => {
+    plan = planCols(pre);
+    if (plan) for (const r of pre.slice(plan.start)) { const o = toObj(r); if (Object.keys(o).length) buf.push(o); }
+    pre = null;
+  };
+  const flush = async (all) => {
+    while (buf.length >= 1000 || (all && buf.length)) {
+      const batch = buf.splice(0, 1000).map((o) => ({ ...o, archivo: f.name, fila: ++fila, busqueda: colNorm(COLORD.map((c) => o[c] || '').join(' ')) }));
+      let err;
+      for (let t = 0; t < 3; t++) {
+        ({ error: err } = await window.__sb.from('personas').insert(batch));
+        if (!err) break;
+        await new Promise((r) => setTimeout(r, 1500 * (t + 1)));
+      }
+      if (err) throw { code: 'db' };
+      total += batch.length;
+      it.status = 'uploading'; it.progress = { done: Math.min(Math.floor(read / 1048576), Math.ceil(f.size / 1048576)), total: Math.max(1, Math.ceil(f.size / 1048576)) }; paintItem(it);
+    }
+  };
+  return {
+    startSheet() { pre = []; plan = null; },
+    row(r) {
+      if (!seen.length) seen = r.map((v) => String(v).trim()).filter(Boolean).slice(0, 8);
+      if (pre) { pre.push(r); if (pre.length >= 300) setPlan(); }
+      else if (plan) { const o = toObj(r); if (Object.keys(o).length) buf.push(o); }
+    },
+    endSheet() { if (pre && pre.length >= 2) setPlan(); pre = null; },
+    addRead(n) { read += n; },
+    pending() { return buf.length >= 1000; },
+    flush,
+    async finish() { await flush(true); if (!total) throw { code: 'sin_columnas', seen }; return total; }
+  };
+}
+async function importCsv(it, f) {
+  const head = new Uint8Array(await f.slice(0, 1 << 20).arrayBuffer());
+  let enc = 'utf-8';
+  try { new TextDecoder('utf-8', { fatal: true }).decode(head.slice(0, Math.max(0, head.length - 4))); } catch { enc = 'windows-1252'; }
+  const first = new TextDecoder(enc).decode(head).split(/\r?\n/)[0] || '';
+  const delim = [',', ';', '\t', '|'].map((d) => [d, first.split(d).length]).sort((x, y) => y[1] - x[1])[0][0];
+  const imp = await makeImporter(it, f);
+  imp.startSheet();
+  const parser = makeCsvParser(delim, (r) => imp.row(r));
+  const reader = f.stream().getReader(), dec = new TextDecoder(enc);
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    imp.addRead(value.length);
+    parser.push(dec.decode(value, { stream: true }));
+    if (imp.pending()) await imp.flush(false);
+  }
+  parser.push(dec.decode()); parser.end();
+  imp.endSheet();
+  return imp.finish();
+}
+async function saveRecord(it, f, ext, kind, n) {
+  const prev = S.files.find((x) => x.name === f.name), now = new Date().toISOString();
+  const ref = prev ? S.db.collection('files').doc(prev.id) : S.db.collection('files').doc();
+  await ref.set({ name: f.name, originalName: f.name, ext, kind, size: f.size, rows: n, tags: (prev && prev.tags) || [], notes: (prev && prev.notes) || '', fav: !!(prev && prev.fav), status: 'available', hasText: false, createdAt: (prev && prev.createdAt) || now, updatedAt: now });
+  it.docId = ref.id; it.status = 'done'; paintItem(it);
+}
+const decodeXml = (t) => t.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (m, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[e.toLowerCase()] ?? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)))).replace(/_x([0-9A-Fa-f]{4})_/g, (m, h) => String.fromCharCode(parseInt(h, 16)));
+const xmlText = (inner) => decodeXml([...inner.replace(/<rPh\b[\s\S]*?<\/rPh>/g, '').matchAll(/<t\b[^>]*?(?:\/>|>([\s\S]*?)<\/t>)/g)].map((m) => m[1] || '').join(''));
+function takeSi(c, out) {
+  let i = 0;
+  for (;;) {
+    const a = c.indexOf('<si', i);
+    if (a < 0) return c.slice(Math.max(i, c.length - 3));
+    if (!' >/'.includes(c[a + 3] ?? '')) { i = a + 3; continue; }
+    const gt = c.indexOf('>', a);
+    if (gt < 0) return c.slice(a);
+    if (c[gt - 1] === '/') { out.push(''); i = gt + 1; continue; }
+    const b = c.indexOf('</si>', gt);
+    if (b < 0) return c.slice(a);
+    out.push(xmlText(c.slice(gt + 1, b)));
+    i = b + 5;
+  }
+}
+function takeRows(c, cb) {
+  let i = 0;
+  for (;;) {
+    const a = c.indexOf('<row', i);
+    if (a < 0) return c.slice(Math.max(i, c.length - 4));
+    if (!' >/'.includes(c[a + 4] ?? '')) { i = a + 4; continue; }
+    const gt = c.indexOf('>', a);
+    if (gt < 0) return c.slice(a);
+    if (c[gt - 1] === '/') { i = gt + 1; continue; }
+    const b = c.indexOf('</row>', gt);
+    if (b < 0) return c.slice(a);
+    cb(c.slice(gt + 1, b));
+    i = b + 6;
+  }
+}
+function parseStyles(t, out) {
+  const custom = {};
+  for (const m of t.matchAll(/<numFmt\b([^>]*)>/g)) { const id = (m[1].match(/numFmtId="(\d+)"/) || [])[1], fc = (m[1].match(/formatCode="([^"]*)"/) || [])[1]; if (id && fc) custom[id] = fc; }
+  const blk = (t.match(/<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/) || [])[1] || '';
+  for (const m of blk.matchAll(/<xf\b([^>]*)>/g)) {
+    const id = (m[1].match(/numFmtId="(\d+)"/) || [])[1];
+    let d = false;
+    if (id !== undefined) {
+      const n = +id;
+      if ((n >= 14 && n <= 22) || (n >= 27 && n <= 36) || (n >= 45 && n <= 47) || (n >= 50 && n <= 58)) d = true;
+      else if (custom[id]) d = /[dmyhs]/i.test(custom[id].replace(/&quot;[^]*?&quot;|"[^"]*"|\[[^\]]*\]|\\./g, ''));
+    }
+    out.push(d);
+  }
+}
+const colIdx = (s) => { let n = 0; for (const ch of s) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+function fmtSerial(v) {
+  const n = Number(v);
+  if (!isFinite(n)) return v;
+  if (n < 1) { const m = Math.round(n * 1440); return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); }
+  const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(n) * 86400000);
+  return String(d.getUTCDate()).padStart(2, '0') + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + d.getUTCFullYear();
+}
+function parseRow(x, strings, dateXf) {
+  const out = []; let next = 0;
+  for (const m of x.matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+    const at = m[1], body = m[2] || '';
+    const r = at.match(/\br="([A-Z]+)\d*"/), ci = r ? colIdx(r[1]) : next;
+    const t = (at.match(/\bt="(\w+)"/) || [])[1], st = (at.match(/\bs="(\d+)"/) || [])[1];
+    const vm = body.match(/<v>([\s\S]*?)<\/v>/);
+    let val = '';
+    if (t === 'inlineStr') val = xmlText((body.match(/<is>([\s\S]*?)<\/is>/) || [])[1] || '');
+    else if (vm) {
+      if (t === 's') val = strings[+vm[1]] ?? '';
+      else if (t === 'str') val = decodeXml(vm[1]);
+      else if (t === 'b') val = vm[1] === '1' ? 'TRUE' : 'FALSE';
+      else if (t === 'e') val = '';
+      else if (t === 'd') val = vm[1];
+      else val = st !== undefined && dateXf[+st] ? fmtSerial(vm[1]) : vm[1];
+    }
+    while (out.length < ci) out.push('');
+    out[ci] = val; next = ci + 1;
+  }
+  return out;
+}
+async function unzipPass(f, want, onData, afterPush) {
+  let failure = null;
+  const unzip = new fflate.Unzip();
+  unzip.register(fflate.UnzipInflate);
+  unzip.register(fflate.UnzipPassThrough);
+  unzip.onfile = (file) => {
+    const key = want(file.name);
+    if (!key) return;
+    file.ondata = (err, data, final) => { if (err) { failure = err; return; } onData(key, data, final); };
+    file.start();
+  };
+  const reader = f.stream().getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) { unzip.push(new Uint8Array(0), true); break; }
+    unzip.push(value, false);
+    if (failure) throw failure;
+    if (afterPush) await afterPush(value.length);
+  }
+  if (failure) throw failure;
+}
+async function importXlsx(it, f) {
+  const strings = [], dateXf = [], sst = { dec: new TextDecoder(), carry: '' }, sty = { dec: new TextDecoder(), text: '' };
+  await unzipPass(f, (n) => (n === 'xl/sharedStrings.xml' ? 'sst' : n === 'xl/styles.xml' ? 'sty' : null), (key, data, final) => {
+    if (key === 'sty') { sty.text += sty.dec.decode(data, { stream: !final }); if (final) parseStyles(sty.text, dateXf); }
+    else { sst.carry += sst.dec.decode(data, { stream: !final }); sst.carry = takeSi(sst.carry, strings); }
+  });
+  const imp = await makeImporter(it, f), sh = { dec: new TextDecoder(), carry: '' };
+  let started = false;
+  const onRow = (x) => { const r = parseRow(x, strings, dateXf); if (r.some((v) => v !== '')) imp.row(r); };
+  await unzipPass(f, (n) => {
+    if (!/^xl\/worksheets\/[^/]+\.xml$/.test(n)) return null;
+    if (started) imp.endSheet();
+    imp.startSheet(); started = true; sh.dec = new TextDecoder(); sh.carry = '';
+    return 'sheet';
+  }, (key, data, final) => { sh.carry += sh.dec.decode(data, { stream: !final }); sh.carry = takeRows(sh.carry, onRow); },
+  async (n) => { imp.addRead(n); if (imp.pending()) await imp.flush(false); });
+  if (started) imp.endSheet();
+  return imp.finish();
+}
 async function borrarFilas(name, n) {
   for (let a = 0; a < n; a += 5000) {
     const { error } = await window.__sb.from('personas').delete().eq('archivo', name).gt('fila', a).lte('fila', a + 5000);
@@ -3338,6 +3552,10 @@ async function runItem(it) {
     if (!f.size) throw { code: 'empty' };
     const ext = extOf(f.name), kind = kindOf(ext);
     if (kind !== 'excel' && kind !== 'csv') throw { code: 'formato' };
+    if (kind === 'csv') { await saveRecord(it, f, ext, kind, await importCsv(it, f)); return; }
+    const magic = new Uint8Array(await f.slice(0, 4).arrayBuffer());
+    if (magic[0] === 0x50 && magic[1] === 0x4b && window.fflate) { await saveRecord(it, f, ext, kind, await importXlsx(it, f)); return; }
+    if (f.size > 6 * MiB) throw { code: 'xlsx_grande' };
     const XLSX = await getXlsx();
     let wb = kind === 'csv' ? XLSX.read(decodeText(await f.arrayBuffer()).text, { type: 'string' }) : XLSX.read(new Uint8Array(await f.arrayBuffer()), { type: 'array' });
     const rows = [], ign = new Set(), seen = [];
@@ -3381,8 +3599,8 @@ async function runItem(it) {
     if (ign.size) toast('Columnas no reconocidas (no se guardaron)', [...ign].join(', '), 'warning');
   } catch (e) {
     const c = e && e.code;
-    it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'sin_columnas' ? 'No encontré columnas conocidas. En la primera fila vi: ' + ((e.seen || []).join(', ') || 'nada') + '.' : 'No se pudo guardar en la base de datos. Revisa tu conexión y reintenta.';
-    it.retryable = !['empty', 'formato', 'sin_columnas'].includes(c);
+    it.error = c === 'empty' ? 'El archivo está vacío.' : c === 'formato' ? 'Solo se pueden subir tablas de Excel o CSV.' : c === 'xlsx_grande' ? 'Este Excel es muy pesado para leerlo en el celular. Guárdalo como .xlsx o CSV y súbelo otra vez.' : c === 'sin_columnas' ? 'No encontré columnas conocidas. En la primera fila vi: ' + ((e.seen || []).join(', ') || 'nada') + '.' : 'No se pudo guardar en la base de datos. Revisa tu conexión y reintenta.';
+    it.retryable = !['empty', 'formato', 'sin_columnas', 'xlsx_grande'].includes(c);
     it.status = 'error'; paintItem(it);
   }
 }
